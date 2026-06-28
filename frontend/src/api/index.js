@@ -159,6 +159,7 @@ export async function getMarkets() {
 export async function startMarketCollect(market, incremental = true) {
   const { data } = await api.post('/collect/market', null, {
     params: { market, incremental },
+    timeout: 120000,
   })
   return data
 }

@@ -250,16 +250,94 @@ def _is_recent_quarter(quarter_label: str) -> bool:
 async def start_market_collect(
     market: str, incremental: bool
 ) -> dict:
-    """Start collection for all stocks in a market."""
+    """Start collection for all stocks in a market — returns immediately with a task ID."""
+    task_id = _new_task_id()
+
+    # Create task entry immediately so the frontend can start polling
+    _batch_tasks[task_id] = {
+        "taskId": task_id,
+        "status": "running",
+        "total": 0,
+        "completed": 0,
+        "failed": 0,
+        "skipped": 0,
+        "currentStock": "正在获取股票列表...",
+        "errors": [],
+        "results": [],
+        "startedAt": datetime.now().isoformat(),
+    }
+
+    # Launch background task: fetch stocks then batch collect
+    asyncio.create_task(_run_market_collect(task_id, market, incremental))
+
+    return {"taskId": task_id, "total": 0}
+
+
+async def _run_market_collect(task_id: str, market: str, incremental: bool):
+    """Background task: fetch market stock list then run batch collection."""
+    task = _batch_tasks[task_id]
     try:
         stocks = await _get_market_stocks(market)
     except Exception as e:
-        return {"error": f"获取市场股票列表失败: {e}"}
+        task["status"] = "failed"
+        task["errors"].append({"keyword": market, "error": f"获取股票列表失败: {e}"})
+        task["currentStock"] = ""
+        logger.error(f"Market collect failed for {market}: {e}")
+        return
 
     if not stocks:
-        return {"error": f"市场 {market} 没有找到股票"}
+        task["status"] = "failed"
+        task["errors"].append({"keyword": market, "error": f"市场 {market} 没有找到股票"})
+        task["currentStock"] = ""
+        return
 
-    return await start_batch_collect(stocks, incremental)
+    task["total"] = len(stocks)
+
+    # Reuse batch collection logic
+    for i, kw in enumerate(stocks):
+        task["currentStock"] = kw
+        try:
+            async with async_session() as db:
+                if incremental:
+                    status = await check_stock_status(kw, db)
+                    if status.get("inDb") and status.get("quartersInDb", 0) >= 16:
+                        latest_q = status.get("latestQuarter", "")
+                        if latest_q and _is_recent_quarter(latest_q):
+                            task["skipped"] += 1
+                            task["completed"] += 1
+                            task["results"].append({
+                                "keyword": kw,
+                                "status": "skipped",
+                                "reason": f"已有{status['quartersInDb']}季度数据，最新{latest_q}",
+                            })
+                            continue
+
+                result = await collect_single_stock(kw, db)
+                if result["success"]:
+                    task["completed"] += 1
+                    task["results"].append({
+                        "keyword": kw,
+                        "status": "success",
+                        "stockCode": result["stockCode"],
+                        "stockName": result["stockName"],
+                        "quartersInDb": result["quartersInDb"],
+                    })
+                else:
+                    task["failed"] += 1
+                    task["errors"].append({
+                        "keyword": kw,
+                        "error": result.get("error", "未知错误"),
+                    })
+        except Exception as e:
+            task["failed"] += 1
+            task["errors"].append({
+                "keyword": kw,
+                "error": str(e),
+            })
+            logger.error(f"Market collect error for {kw}: {e}")
+
+    task["status"] = "complete"
+    task["currentStock"] = ""
 
 
 async def _get_market_stocks(market: str) -> list[str]:

@@ -330,7 +330,8 @@ function rebuildChart() {
     .sort((a, b) => a[0].localeCompare(b[0]))
 
   const labels = axis.map(([, q]) => q)
-  const palette = ['#2563eb', '#0891b2', '#16a34a', '#7c3aed', '#ea580c', '#db2777']
+  const root = document.querySelector('[data-theme]') || document.documentElement
+  const palette = [1,2,3,4,5,6].map(i => getComputedStyle(root).getPropertyValue(`--chart-${i}`).trim())
 
   const datasets = result.value.stocks.map((s, idx) => {
     const byDate = Object.fromEntries(s.quarters.map(q => [q.reportDate, q]))
@@ -384,6 +385,10 @@ watch(currentChartKey, () => {
 })
 
 watch(() => result.value?.stocks, () => {
+  nextTick(rebuildChart)
+})
+
+watch(() => skinStore.currentSkin, () => {
   nextTick(rebuildChart)
 })
 
