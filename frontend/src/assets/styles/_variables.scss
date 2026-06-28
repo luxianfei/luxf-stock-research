@@ -1,0 +1,86 @@
+// Color tokens — tech (科技蓝) theme
+[data-theme="tech"] {
+  --base: #2563eb;
+  --base-hover: #1d4ed8;
+  --base-border: #bfdbfe;
+  --base-gradient: linear-gradient(135deg, #2563eb, #0891b2);
+  --base-glow: rgba(37, 99, 235, 0.15);
+
+  --accent: #d63950;
+  --up: #d63950;
+  --down: #16a34a;
+
+  --text: #1e293b;
+  --text-mid: #475569;
+  --text-muted: #94a3b8;
+  --text-soft: #cbd5e1;
+
+  --border: #eef1f5;
+  --card-bg: #ffffff;
+  --shadow-soft: rgba(0, 0, 0, 0.04);
+
+  --chart-1: #2563eb;
+  --chart-2: #0891b2;
+  --chart-3: #16a34a;
+  --chart-4: #7c3aed;
+  --chart-5: #ea580c;
+  --chart-6: #db2777;
+}
+
+// Color tokens — bull (牛市红) theme
+[data-theme="bull"] {
+  --base: #dc2626;
+  --base-hover: #b91c1c;
+  --base-border: #fca5a5;
+  --base-gradient: linear-gradient(135deg, #dc2626, #ea580c);
+  --base-glow: rgba(220, 38, 38, 0.15);
+
+  --accent: #d63950;
+  --up: #d63950;
+  --down: #16a34a;
+
+  --text: #1e293b;
+  --text-mid: #475569;
+  --text-muted: #94a3b8;
+  --text-soft: #cbd5e1;
+
+  --border: #f5eef0;
+  --card-bg: #ffffff;
+  --shadow-soft: rgba(0, 0, 0, 0.04);
+
+  --chart-1: #d63950;
+  --chart-2: #ea580c;
+  --chart-3: #dc2626;
+  --chart-4: #a855f7;
+  --chart-5: #ca8a04;
+  --chart-6: #db2777;
+}
+
+// Color tokens — gold (土豪金) theme
+[data-theme="gold"] {
+  --base: #b8860b;
+  --base-hover: #8b6508;
+  --base-border: #fde68a;
+  --base-gradient: linear-gradient(135deg, #b8860b, #d97706);
+  --base-glow: rgba(184, 134, 11, 0.18);
+
+  --accent: #92400e;
+  --up: #d63950;
+  --down: #16a34a;
+
+  --text: #1e293b;
+  --text-mid: #475569;
+  --text-muted: #94a3b8;
+  --text-soft: #cbd5e1;
+
+  --border: #f3ede0;
+  --card-bg: #ffffff;
+  --shadow-soft: rgba(0, 0, 0, 0.04);
+
+  --chart-1: #b8860b;
+  --chart-2: #d97706;
+  --chart-3: #9a3412;
+  --chart-4: #7c2d12;
+  --chart-5: #6b21a8;
+  --chart-6: #be185d;
+}
