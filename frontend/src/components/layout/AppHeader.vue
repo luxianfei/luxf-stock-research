@@ -7,7 +7,7 @@
       </router-link>
       <nav class="nav-links">
         <router-link to="/" class="nav-link">财务分析</router-link>
-        <router-link to="/invest" class="nav-link">龙江投资</router-link>
+        <router-link to="/invest" class="nav-link">智者投资</router-link>
         <router-link to="/collect" class="nav-link">数据采集</router-link>
       </nav>
       <SkinSwitch />

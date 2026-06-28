@@ -2,7 +2,7 @@
   <div>
     <!-- Board summary -->
     <div style="background:var(--base-gradient);border-radius:12px;padding:20px 24px;margin-bottom:20px;color:#fff">
-      <div style="font-size:20px;font-weight:700;margin-bottom:4px">龙江投资 · 股票池</div>
+      <div style="font-size:20px;font-weight:700;margin-bottom:4px">智者投资 · 股票池</div>
       <div style="font-size:13px;opacity:0.85">
         价值景气投资法 · 增量市场，稀缺卡位 · 顺势而为
         <span style="margin-left:12px">{{ todayStr }}</span>

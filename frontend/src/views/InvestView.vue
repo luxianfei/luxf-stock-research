@@ -1,7 +1,7 @@
 <template>
   <div>
     <h1 class="page-title" style="text-align:center;font-size:32px;font-weight:700;letter-spacing:2px;margin:8px 0 28px">
-      龙江投资
+      智者投资
     </h1>
     <p style="text-align:center;color:var(--text-muted);margin-bottom:24px">
       价值景气投资法 · 增量市场，稀缺卡位 · 顺势而为

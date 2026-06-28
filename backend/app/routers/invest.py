@@ -1,4 +1,4 @@
-"""Invest (龙江投资) API router — stock pool, big yang, SOP checkup, valuation."""
+"""Invest (智者投资) API router — stock pool, big yang, SOP checkup, valuation."""
 import logging
 from datetime import datetime
 
