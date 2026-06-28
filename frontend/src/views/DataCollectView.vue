@@ -405,8 +405,9 @@ function clearBatchPolling() {
 
 // ── Tab 3: By Market ──
 const DEFAULT_MARKETS = [
-  { code: 'chinext', name: '创业板', prefix: '300' },
-  { code: 'star', name: '科创板', prefix: '688' },
+  { code: 'all', name: '全市场', prefix: '全部' },
+  { code: 'gem', name: '创业板', prefix: '30' },
+  { code: 'star', name: '科创板', prefix: '68' },
   { code: 'sh_main', name: '上海主板', prefix: '60' },
   { code: 'sz_main', name: '深圳主板', prefix: '00' },
 ]

@@ -6,7 +6,10 @@ import asyncio
 import csv
 import io
 import logging
+import random
+import threading
 import uuid
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime
 from typing import Optional
 
@@ -20,7 +23,11 @@ from app.services.data_fetcher import (
     search_stock,
     get_quarterly_data,
     get_stock_basic_info,
+    _sync_get_quarterly_data,
     _bs_lock,
+    _login,
+    _logout,
+    BaostockSessionPool,
 )
 from app.services.financial_calc import compute_10ps_valuation
 from app.routers.stock import _upsert_stock, _upsert_quarters
@@ -29,6 +36,11 @@ logger = logging.getLogger(__name__)
 
 # Default quarters to fetch: 16 display + 5 for YoY/TTM reference
 DEFAULT_QUARTERS = 21
+
+# Concurrency: number of parallel baostock sessions
+MAX_CONCURRENT_STOCKS = 3
+# Anti-crawl: random delay range (seconds) between baostock requests per session
+_anti_crawl_delay = (0.3, 0.8)
 
 # In-memory task tracker for batch operations
 _batch_tasks: dict[str, dict] = {}
@@ -179,21 +191,62 @@ async def start_batch_collect(
     return {"taskId": task_id, "totalStocks": len(keywords)}
 
 
-async def _run_batch(task_id: str, keywords: list[str], incremental: bool):
-    """Run batch collection in background."""
-    task = _batch_tasks[task_id]
+def _sync_fetch_quarterly_data(
+    stock_code: str,
+    quarters: int = DEFAULT_QUARTERS,
+) -> dict:
+    """Fetch quarterly data for a single stock in a thread.
 
-    for i, kw in enumerate(keywords):
-        task["currentStock"] = kw
-        try:
-            async with async_session() as db:
-                # Incremental check
-                if incremental:
-                    status = await check_stock_status(kw, db)
-                    if status.get("inDb") and status.get("quartersInDb", 0) >= 16:
-                        # Check if latest quarter is recent enough
-                        latest_q = status.get("latestQuarter", "")
-                        if latest_q and _is_recent_quarter(latest_q):
+    Creates its own baostock session (sessions can't be shared across threads).
+    Uses quarter=0 (batch by year) → 25 calls instead of 100.
+    Returns dict with: success, stockCode, quartersCollected, quarters, error
+    """
+    import time
+
+    _bs_lock.acquire()
+    try:
+        bs, lg = _login()
+        raw_quarters = _sync_get_quarterly_data(stock_code, quarters, bs_session=bs)
+        _logout(bs, lg)
+
+        # Anti-crawl: random delay
+        delay = random.uniform(*_anti_crawl_delay)
+        time.sleep(delay)
+
+        if not raw_quarters:
+            return {
+                "success": False,
+                "stockCode": stock_code,
+                "error": "未获取到财务数据"
+            }
+
+        return {
+            "success": True,
+            "stockCode": stock_code,
+            "quartersCollected": len(raw_quarters),
+            "quarters": raw_quarters
+        }
+
+    except Exception as e:
+        logger.error(f"Batch collect failed for {stock_code}: {e}")
+        return {"success": False, "stockCode": stock_code, "error": str(e)}
+
+    finally:
+        _bs_lock.release()
+
+
+async def _collect_one_stock(kw: str, incremental: bool, task: dict):
+    """Collect data for a single stock with anti-crawl delay and thread-safe task updates."""
+    task["currentStock"] = kw
+    try:
+        async with async_session() as db:
+            # Incremental check
+            if incremental:
+                status = await check_stock_status(kw, db)
+                if status.get("inDb") and status.get("quartersInDb", 0) >= 16:
+                    latest_q = status.get("latestQuarter", "")
+                    if latest_q and _is_recent_quarter(latest_q):
+                        with threading.Lock():
                             task["skipped"] += 1
                             task["completed"] += 1
                             task["results"].append({
@@ -201,9 +254,10 @@ async def _run_batch(task_id: str, keywords: list[str], incremental: bool):
                                 "status": "skipped",
                                 "reason": f"已有{status['quartersInDb']}季度数据，最新{latest_q}",
                             })
-                            continue
+                        return
 
-                result = await collect_single_stock(kw, db)
+            result = await collect_single_stock(kw, db)
+            with threading.Lock():
                 if result["success"]:
                     task["completed"] += 1
                     task["results"].append({
@@ -219,13 +273,113 @@ async def _run_batch(task_id: str, keywords: list[str], incremental: bool):
                         "keyword": kw,
                         "error": result.get("error", "未知错误"),
                     })
-        except Exception as e:
+    except Exception as e:
+        with threading.Lock():
             task["failed"] += 1
             task["errors"].append({
                 "keyword": kw,
                 "error": str(e),
             })
-            logger.error(f"Batch collect error for {kw}: {e}")
+        logger.error(f"Batch collect error for {kw}: {e}")
+
+    # Anti-crawl: random delay between requests
+    delay = random.uniform(*_anti_crawl_delay)
+    await asyncio.sleep(delay)
+
+
+async def _run_batch(task_id: str, keywords: list[str], incremental: bool):
+    """Run batch collection with thread pool for parallel baostock calls."""
+    task = _batch_tasks[task_id]
+
+    # Phase 1: Fetch all quarterly data in parallel using thread pool
+    loop = asyncio.get_event_loop()
+    fetch_results = {}
+
+    with ThreadPoolExecutor(max_workers=MAX_CONCURRENT_STOCKS) as executor:
+        future_to_kw = {
+            executor.submit(_sync_fetch_quarterly_data, kw, DEFAULT_QUARTERS): kw
+            for kw in keywords
+        }
+        for future in as_completed(future_to_kw):
+            kw = future_to_kw[future]
+            try:
+                fetch_results[kw] = future.result()
+            except Exception as e:
+                fetch_results[kw] = {
+                    "success": False,
+                    "stockCode": kw,
+                    "error": str(e)
+                }
+
+    # Phase 2: Process results and upsert to DB (async, one at a time for DB safety)
+    for kw in keywords:
+        result = fetch_results.get(kw, {"success": False, "error": "No result"})
+
+        if result["success"]:
+            try:
+                async with async_session() as db:
+                    search_results = await search_stock(kw)
+                    if search_results:
+                        match = search_results[0]
+                        stock_code = result["stockCode"]
+                        stock_name = match.get("stock_name", "")
+
+                        # Get basic info
+                        basic = await get_stock_basic_info(
+                            stock_code,
+                            quarters_data=result["quarters"]
+                        )
+                        if not basic:
+                            basic = match
+
+                        # Upsert
+                        stock = await _upsert_stock(match, basic, db)
+                        await _upsert_quarters(
+                            stock_code,
+                            result["quarters"],
+                            db
+                        )
+
+                        # Query stored data
+                        stmt = (
+                            select(FinancialQuarterly)
+                            .where(FinancialQuarterly.stock_code == stock_code)
+                            .order_by(FinancialQuarterly.report_date)
+                        )
+                        db_result = await db.execute(stmt)
+                        stored = list(db_result.scalars().all())
+
+                        with threading.Lock():
+                            task["completed"] += 1
+                            task["results"].append({
+                                "keyword": kw,
+                                "status": "success",
+                                "stockCode": stock_code,
+                                "stockName": stock_name,
+                                "quartersInDb": len(stored),
+                            })
+                    else:
+                        with threading.Lock():
+                            task["failed"] += 1
+                            task["errors"].append({
+                                "keyword": kw,
+                                "error": "未找到股票",
+                            })
+            except Exception as e:
+                with threading.Lock():
+                    task["failed"] += 1
+                    task["errors"].append({
+                        "keyword": kw,
+                        "error": str(e),
+                    })
+                logger.error(f"DB upsert error for {kw}: {e}")
+        else:
+            with threading.Lock():
+                task["failed"] += 1
+                task["errors"].append({
+                    "keyword": kw,
+                    "error": result.get("error", "未知错误"),
+                })
 
     task["status"] = "complete"
     task["currentStock"] = ""
@@ -274,7 +428,7 @@ async def start_market_collect(
 
 
 async def _run_market_collect(task_id: str, market: str, incremental: bool):
-    """Background task: fetch market stock list then run batch collection."""
+    """Background task: fetch market stock list then run parallel batch collection."""
     task = _batch_tasks[task_id]
     try:
         stocks = await _get_market_stocks(market)
@@ -293,48 +447,94 @@ async def _run_market_collect(task_id: str, market: str, incremental: bool):
 
     task["total"] = len(stocks)
 
-    # Reuse batch collection logic
-    for i, kw in enumerate(stocks):
-        task["currentStock"] = kw
-        try:
-            async with async_session() as db:
-                if incremental:
-                    status = await check_stock_status(kw, db)
-                    if status.get("inDb") and status.get("quartersInDb", 0) >= 16:
-                        latest_q = status.get("latestQuarter", "")
-                        if latest_q and _is_recent_quarter(latest_q):
-                            task["skipped"] += 1
+    # Phase 1: Fetch all quarterly data in parallel using thread pool
+    fetch_results = {}
+
+    with ThreadPoolExecutor(max_workers=MAX_CONCURRENT_STOCKS) as executor:
+        future_to_kw = {
+            executor.submit(_sync_fetch_quarterly_data, kw, DEFAULT_QUARTERS): kw
+            for kw in stocks
+        }
+        for future in as_completed(future_to_kw):
+            kw = future_to_kw[future]
+            try:
+                fetch_results[kw] = future.result()
+            except Exception as e:
+                fetch_results[kw] = {
+                    "success": False,
+                    "stockCode": kw,
+                    "error": str(e)
+                }
+
+    # Phase 2: Process results and upsert to DB
+    for kw in stocks:
+        result = fetch_results.get(kw, {"success": False, "error": "No result"})
+
+        if result["success"]:
+            try:
+                async with async_session() as db:
+                    search_results = await search_stock(kw)
+                    if search_results:
+                        match = search_results[0]
+                        stock_code = result["stockCode"]
+                        stock_name = match.get("stock_name", "")
+
+                        # Get basic info
+                        basic = await get_stock_basic_info(
+                            stock_code,
+                            quarters_data=result["quarters"]
+                        )
+                        if not basic:
+                            basic = match
+
+                        # Upsert
+                        stock = await _upsert_stock(match, basic, db)
+                        await _upsert_quarters(
+                            stock_code,
+                            result["quarters"],
+                            db
+                        )
+
+                        # Query stored data
+                        stmt = (
+                            select(FinancialQuarterly)
+                            .where(FinancialQuarterly.stock_code == stock_code)
+                            .order_by(FinancialQuarterly.report_date)
+                        )
+                        db_result = await db.execute(stmt)
+                        stored = list(db_result.scalars().all())
+
+                        with threading.Lock():
                             task["completed"] += 1
                             task["results"].append({
                                 "keyword": kw,
-                                "status": "skipped",
-                                "reason": f"已有{status['quartersInDb']}季度数据，最新{latest_q}",
+                                "status": "success",
+                                "stockCode": stock_code,
+                                "stockName": stock_name,
+                                "quartersInDb": len(stored),
                             })
-                            continue
-
-                result = await collect_single_stock(kw, db)
-                if result["success"]:
-                    task["completed"] += 1
-                    task["results"].append({
-                        "keyword": kw,
-                        "status": "success",
-                        "stockCode": result["stockCode"],
-                        "stockName": result["stockName"],
-                        "quartersInDb": result["quartersInDb"],
-                    })
-                else:
+                    else:
+                        with threading.Lock():
+                            task["failed"] += 1
+                            task["errors"].append({
+                                "keyword": kw,
+                                "error": "未找到股票",
+                            })
+            except Exception as e:
+                with threading.Lock():
                     task["failed"] += 1
                     task["errors"].append({
                         "keyword": kw,
-                        "error": result.get("error", "未知错误"),
+                        "error": str(e),
                     })
-        except Exception as e:
-            task["failed"] += 1
-            task["errors"].append({
-                "keyword": kw,
-                "error": str(e),
-            })
-            logger.error(f"Market collect error for {kw}: {e}")
+                logger.error(f"DB upsert error for {kw}: {e}")
+        else:
+            with threading.Lock():
+                task["failed"] += 1
+                task["errors"].append({
+                    "keyword": kw,
+                    "error": result.get("error", "未知错误"),
+                })
 
     task["status"] = "complete"
     task["currentStock"] = ""
@@ -348,6 +548,7 @@ async def _get_market_stocks(market: str) -> list[str]:
         "star": {"name": "科创板", "exchange": "SH", "prefixes": ["688", "689"]},
         "sh_main": {"name": "上海主板", "exchange": "SH", "prefixes": ["600", "601", "603", "605"]},
         "sz_main": {"name": "深圳主板", "exchange": "SZ", "prefixes": ["000", "001", "002", "003"]},
+        "all": {"name": "全市场", "exchange": None, "prefixes": None},  # all markets
     }
 
     config = MARKET_CONFIG.get(market)
@@ -360,9 +561,14 @@ async def _get_market_stocks(market: str) -> list[str]:
     lg = bs.login()
     try:
         rs = bs.query_stock_basic()
+        if rs.error_code != "0":
+            raise RuntimeError(f"baostock query_stock_basic failed: {rs.error_msg}")
+        
         rows = []
-        while (rs.error_code == "0") and rs.next():
+        while rs.next():
             rows.append(rs.get_row_data())
+
+        logger.info(f"baostock returned {len(rows)} total stocks for market={market}")
 
         stocks = []
         for row in rows:
@@ -372,14 +578,20 @@ async def _get_market_stocks(market: str) -> list[str]:
             exchange_part, code_part = code.split(".", 1)
             exchange = exchange_part.upper()
 
+            # For "all" market, include all stocks
+            if market == "all":
+                stocks.append(f"{code_part}.{exchange}")
+                continue
+
             # Filter by exchange
             if exchange != config["exchange"]:
                 continue
 
             # Filter by code prefix
             if any(code_part.startswith(p) for p in config["prefixes"]):
-                stocks.append(code_part)
+                stocks.append(f"{code_part}.{exchange}")
 
+        logger.info(f"Filtered {len(stocks)} stocks for market={market} (exchange={config['exchange']}, prefixes={config['prefixes']})")
         return stocks
     finally:
         bs.logout()
@@ -389,6 +601,7 @@ async def _get_market_stocks(market: str) -> list[str]:
 def get_market_info() -> list[dict]:
     """Return market definitions with metadata."""
     return [
+        {"id": "all", "name": "全市场", "codePrefix": "全部", "exchange": "ALL"},
         {"id": "gem", "name": "创业板", "codePrefix": "300/301", "exchange": "SZ"},
         {"id": "star", "name": "科创板", "codePrefix": "688/689", "exchange": "SH"},
         {"id": "sh_main", "name": "上海主板", "codePrefix": "600/601/603/605", "exchange": "SH"},

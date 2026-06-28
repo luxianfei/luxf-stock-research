@@ -87,11 +87,24 @@ def _sync_search_stock(keyword: str) -> list[dict]:
             _logout(bs, lg)
 
 
-def _sync_get_quarterly_data(stock_code: str, quarters: int = 16) -> list[dict]:
-    """Fetch quarterly financial data for a stock."""
-    _bs_lock.acquire()
-    try:
+def _sync_get_quarterly_data(stock_code: str, quarters: int = 16, bs_session=None) -> list[dict]:
+    """Fetch quarterly financial data for a stock.
+
+    Optimizations:
+    - Uses quarter=0 (batch by year) -> 25 calls instead of 100 per stock
+    - Accepts optional bs_session for connection reuse in batch mode
+    - Releases _bs_lock between baostock and akshare phases for true parallelism
+    """
+    own_session = False
+    if bs_session is None:
+        _bs_lock.acquire()
         bs, lg = _login()
+        own_session = True
+    else:
+        bs = bs_session
+
+    # ---- Phase 1: baostock queries (holds _bs_lock) ----
+    try:
         # Convert code format: 301536.SZ -> sz.301536
         parts = stock_code.split(".")
         if len(parts) == 2:
@@ -99,15 +112,17 @@ def _sync_get_quarterly_data(stock_code: str, quarters: int = 16) -> list[dict]:
         else:
             bs_code = stock_code
 
-        # Fetch profit, balance, growth, and cash flow data
+        current_year = datetime.now().year
+        years = range(current_year, current_year - 5, -1)
+        quarters_list = [1, 2, 3, 4]
+
         profit_by_date = {}
         balance_by_date = {}
         growth_by_date = {}
         cashflow_by_date = {}
 
-        # Fetch profit data
-        for year in range(datetime.now().year, datetime.now().year - 5, -1):
-            for q in [4, 3, 2, 1]:
+        for year in years:
+            for q in quarters_list:
                 try:
                     rs = bs.query_profit_data(code=bs_code, year=year, quarter=q)
                     df = _query_to_df(rs)
@@ -119,9 +134,8 @@ def _sync_get_quarterly_data(stock_code: str, quarters: int = 16) -> list[dict]:
                 except Exception as e:
                     logger.debug(f"Profit data fetch failed for {bs_code} {year}Q{q}: {e}")
 
-        # Fetch balance data
-        for year in range(datetime.now().year, datetime.now().year - 5, -1):
-            for q in [4, 3, 2, 1]:
+        for year in years:
+            for q in quarters_list:
                 try:
                     rs = bs.query_balance_data(code=bs_code, year=year, quarter=q)
                     df = _query_to_df(rs)
@@ -133,9 +147,8 @@ def _sync_get_quarterly_data(stock_code: str, quarters: int = 16) -> list[dict]:
                 except Exception as e:
                     logger.debug(f"Balance data fetch failed for {bs_code} {year}Q{q}: {e}")
 
-        # Fetch growth data
-        for year in range(datetime.now().year, datetime.now().year - 5, -1):
-            for q in [4, 3, 2, 1]:
+        for year in years:
+            for q in quarters_list:
                 try:
                     rs = bs.query_growth_data(code=bs_code, year=year, quarter=q)
                     df = _query_to_df(rs)
@@ -147,9 +160,8 @@ def _sync_get_quarterly_data(stock_code: str, quarters: int = 16) -> list[dict]:
                 except Exception as e:
                     logger.debug(f"Growth data fetch failed for {bs_code} {year}Q{q}: {e}")
 
-        # Fetch cash flow data (optional)
-        for year in range(datetime.now().year, datetime.now().year - 5, -1):
-            for q in [4, 3, 2, 1]:
+        for year in years:
+            for q in quarters_list:
                 try:
                     rs = bs.query_cash_flow_data(code=bs_code, year=year, quarter=q)
                     df = _query_to_df(rs)
@@ -161,10 +173,9 @@ def _sync_get_quarterly_data(stock_code: str, quarters: int = 16) -> list[dict]:
                 except Exception as e:
                     logger.debug(f"Cash flow data fetch failed for {bs_code} {year}Q{q}: {e}")
 
-        # Fetch operation data (for asset turnover ratio)
         operation_by_date = {}
-        for year in range(datetime.now().year, datetime.now().year - 5, -1):
-            for q in [4, 3, 2, 1]:
+        for year in years:
+            for q in quarters_list:
                 try:
                     rs = bs.query_operation_data(code=bs_code, year=year, quarter=q)
                     df = _query_to_df(rs)
@@ -176,124 +187,110 @@ def _sync_get_quarterly_data(stock_code: str, quarters: int = 16) -> list[dict]:
                 except Exception as e:
                     logger.debug(f"Operation data fetch failed for {bs_code} {year}Q{q}: {e}")
 
-        # Merge by statDate (sorted descending)
         all_dates = sorted(profit_by_date.keys(), reverse=True)
         if not all_dates:
             return []
-
-        # Fetch supplemental data from akshare (扣非净利润 + total revenue)
-        akshare_data = {}
-        try:
-            akshare_data = _sync_fetch_akshare_supplement(stock_code)
-        except Exception as e:
-            logger.warning(f"akshare supplement fetch failed for {stock_code}: {e}")
-
-        # Add akshare-only dates to fill gaps (e.g. 24Q1 when baostock lacks it)
-        # These quarters provide revenue and deducted_net_profit for
-        # cumulative→single-quarter conversion of later quarters.
-        for ak_date in akshare_data:
-            if ak_date not in profit_by_date:
-                profit_by_date[ak_date] = {"_from_akshare": True}
-                all_dates = sorted(profit_by_date.keys(), reverse=True)
-
-        results = []
-        for stat_date in all_dates[:quarters]:
-            quarter_label = _format_quarter(stat_date)
-            profit = profit_by_date.get(stat_date, {})
-            balance = balance_by_date.get(stat_date, {})
-            growth = growth_by_date.get(stat_date, {})
-            cashflow = cashflow_by_date.get(stat_date, {})
-            operation = operation_by_date.get(stat_date, {}) if operation_by_date else {}
-
-            # ---- Profit data (absolute values in yuan) ----
-            net_profit_abs = _safe_float(profit.get("netProfit"))
-            revenue_abs = _safe_float(profit.get("MBRevenue"))
-            np_margin = _safe_float(profit.get("npMargin"))
-            gp_margin = _safe_float(profit.get("gpMargin"))
-            roe_avg = _safe_float(profit.get("roeAvg"))
-            eps_ttm = _safe_float(profit.get("epsTTM"))
-
-            # If MBRevenue is missing, estimate from netProfit / npMargin
-            if revenue_abs is None and net_profit_abs and np_margin and np_margin != 0:
-                revenue_abs = net_profit_abs / np_margin
-
-            # ---- Merge akshare supplement data ----
-            ak_quarter = akshare_data.get(stat_date, {})
-            # Prefer akshare total revenue (营业收入) over baostock MBRevenue (主营营业收入)
-            ak_revenue = ak_quarter.get("revenue_total")
-            if ak_revenue is not None:
-                revenue_abs = ak_revenue
-            # 扣非净利润 (cumulative, yuan)
-            deducted_net_profit_abs = ak_quarter.get("deducted_net_profit")
-
-            # For akshare-only quarters (baostock has no data), revenue already set above
-            # np_margin not available — will be recalculated in process_quarters_for_display
-
-            # ---- Balance data (ratios only) ----
-            current_ratio = _safe_float(balance.get("currentRatio"))
-            liability_to_asset = _safe_float(balance.get("liabilityToAsset"))
-            # Debt ratio: liabilityToAsset is fraction (0~1), convert to percentage
-            debt_ratio_calc = None
-            if liability_to_asset is not None:
-                debt_ratio_calc = liability_to_asset * 100  # e.g., 0.3674 -> 36.74%
-
-            # ---- Growth data ----
-            # YOYNI is net income YoY growth, NOT deducted net profit YoY (扣非同比).
-            # deducted_net_profit_yoy will be calculated on-the-fly from single-quarter net profit.
-            deducted_net_profit_yoy = None
-            # Revenue YoY not directly available; approximate with YOYAsset as fallback
-            revenue_yoy = None  # not available from baostock growth data
-
-            # ---- Cash flow data (ratios) ----
-            # CFOToNP = operating cash flow / net profit ratio
-            cfo_to_np = _safe_float(cashflow.get("CFOToNP"))
-            operating_cashflow = None
-            if cfo_to_np is not None and net_profit_abs is not None:
-                operating_cashflow = cfo_to_np * net_profit_abs  # in yuan
-
-            # ---- Derived: total_assets (estimate from asset turnover) ----
-            # AssetTurnRatio = revenue / total_assets → total_assets = revenue / AssetTurnRatio
-            total_assets_est = None
-            total_equity_est = None
-            asset_turn = _safe_float(operation.get("AssetTurnRatio"))
-            if asset_turn and asset_turn > 0 and revenue_abs:
-                total_assets_est = revenue_abs / asset_turn
-                # total_equity = total_assets * (1 - debt_ratio_fraction)
-                if liability_to_asset is not None:
-                    total_equity_est = total_assets_est * (1 - liability_to_asset)
-
-            # ---- Derived: ROA ----
-            roa_calc = None
-            if net_profit_abs is not None and total_assets_est and total_assets_est > 0:
-                roa_calc = net_profit_abs / total_assets_est
-
-            row = {
-                "quarter": quarter_label,
-                "report_date": stat_date,
-                "revenue_yoy": revenue_yoy,
-                "deducted_net_profit_yoy": deducted_net_profit_yoy,
-                "gross_margin": gp_margin,
-                "net_margin": np_margin,
-                "roe": roe_avg,
-                "roa": roa_calc,
-                "eps": eps_ttm,
-                "revenue": revenue_abs,
-                "net_profit": net_profit_abs,
-                "deducted_net_profit": deducted_net_profit_abs,
-                "deducted_net_profit_ttm": None,
-                "total_assets": total_assets_est,
-                "total_equity": total_equity_est,
-                "operating_cashflow": operating_cashflow,
-                "debt_ratio": debt_ratio_calc,
-                "current_ratio": current_ratio,
-            }
-
-            results.append(row)
-
-        return results
     finally:
-        _logout(bs, lg)
-        _bs_lock.release()
+        # Release baostock session/lock BEFORE akshare HTTP calls
+        if own_session:
+            _logout(bs, lg)
+            _bs_lock.release()
+
+    # ---- Phase 2: akshare HTTP (no lock held — other threads can use baostock) ----
+    akshare_data = {}
+    try:
+        akshare_data = _sync_fetch_akshare_supplement(stock_code)
+    except Exception as e:
+        logger.warning(f"akshare supplement fetch failed for {stock_code}: {e}")
+
+    for ak_date in akshare_data:
+        if ak_date not in profit_by_date:
+            profit_by_date[ak_date] = {"_from_akshare": True}
+            all_dates = sorted(profit_by_date.keys(), reverse=True)
+
+    # ---- Phase 3: merge and build results ----
+    results = []
+    for stat_date in all_dates[:quarters]:
+        quarter_label = _format_quarter(stat_date)
+        profit = profit_by_date.get(stat_date, {})
+        balance = balance_by_date.get(stat_date, {})
+        growth = growth_by_date.get(stat_date, {})
+        cashflow = cashflow_by_date.get(stat_date, {})
+        operation = operation_by_date.get(stat_date, {}) if operation_by_date else {}
+
+        # ---- Profit data (absolute values in yuan) ----
+        net_profit_abs = _safe_float(profit.get("netProfit"))
+        revenue_abs = _safe_float(profit.get("MBRevenue"))
+        np_margin = _safe_float(profit.get("npMargin"))
+        gp_margin = _safe_float(profit.get("gpMargin"))
+        roe_avg = _safe_float(profit.get("roeAvg"))
+        eps_ttm = _safe_float(profit.get("epsTTM"))
+
+        if revenue_abs is None and net_profit_abs and np_margin and np_margin != 0:
+            revenue_abs = net_profit_abs / np_margin
+
+        # ---- Merge akshare supplement data ----
+        ak_quarter = akshare_data.get(stat_date, {})
+        ak_revenue = ak_quarter.get("revenue_total")
+        if ak_revenue is not None:
+            revenue_abs = ak_revenue
+        deducted_net_profit_abs = ak_quarter.get("deducted_net_profit")
+
+        # ---- Balance data (ratios only) ----
+        current_ratio = _safe_float(balance.get("currentRatio"))
+        liability_to_asset = _safe_float(balance.get("liabilityToAsset"))
+        debt_ratio_calc = None
+        if liability_to_asset is not None:
+            debt_ratio_calc = liability_to_asset * 100
+
+        # ---- Growth data ----
+        deducted_net_profit_yoy = None
+        revenue_yoy = None
+
+        # ---- Cash flow data (ratios) ----
+        cfo_to_np = _safe_float(cashflow.get("CFOToNP"))
+        operating_cashflow = None
+        if cfo_to_np is not None and net_profit_abs is not None:
+            operating_cashflow = cfo_to_np * net_profit_abs
+
+        # ---- Derived: total_assets (estimate from asset turnover) ----
+        total_assets_est = None
+        total_equity_est = None
+        asset_turn = _safe_float(operation.get("AssetTurnRatio"))
+        if asset_turn and asset_turn > 0 and revenue_abs:
+            total_assets_est = revenue_abs / asset_turn
+            if liability_to_asset is not None:
+                total_equity_est = total_assets_est * (1 - liability_to_asset)
+
+        # ---- Derived: ROA ----
+        roa_calc = None
+        if net_profit_abs is not None and total_assets_est and total_assets_est > 0:
+            roa_calc = net_profit_abs / total_assets_est
+
+        row = {
+            "quarter": quarter_label,
+            "report_date": stat_date,
+            "revenue_yoy": revenue_yoy,
+            "deducted_net_profit_yoy": deducted_net_profit_yoy,
+            "gross_margin": gp_margin,
+            "net_margin": np_margin,
+            "roe": roe_avg,
+            "roa": roa_calc,
+            "eps": eps_ttm,
+            "revenue": revenue_abs,
+            "net_profit": net_profit_abs,
+            "deducted_net_profit": deducted_net_profit_abs,
+            "deducted_net_profit_ttm": None,
+            "total_assets": total_assets_est,
+            "total_equity": total_equity_est,
+            "operating_cashflow": operating_cashflow,
+            "debt_ratio": debt_ratio_calc,
+            "current_ratio": current_ratio,
+        }
+
+        results.append(row)
+
+    return results
 
 
 def _format_quarter(stat_date: str) -> str:
@@ -517,32 +514,198 @@ async def get_stock_basic_info(stock_code: str, quarters_data: list[dict] | None
 
     info = results[0]
     # Use pre-fetched quarters if provided, otherwise fetch
-    quarters = quarters_data or await get_quarterly_data(stock_code, quarters=8)
-    if quarters:
-        latest = quarters[0]
-        info["latest_net_margin"] = latest.get("net_margin")
+    if quarters_data is None:
+        quarters_data = await get_quarterly_data(stock_code)
 
-        # Revenue is now in yuan; convert to 亿元 for forecast
-        latest_revenue = latest.get("revenue")
-        if latest_revenue and latest_revenue > 0:
-            revenue_yi = latest_revenue / 1e8  # yuan -> 亿元
-            y1_revenue_yi = revenue_yi * 1.2   # naive 20% growth
-            y2_revenue_yi = y1_revenue_yi * 1.2
-            info["forecast_revenue_y1_yi"] = round(y1_revenue_yi, 2)
-            info["forecast_revenue_y2_yi"] = round(y2_revenue_yi, 2)
+    # Compute valuation metrics
+    from app.services.financial_calc import compute_10ps_valuation
+    valuation = compute_10ps_valuation(quarters_data)
 
-            # 10PS: fair market cap = next year revenue(亿) × 10
-            nm = latest.get("net_margin", 0) or 0
-            ten_ps_fair = y1_revenue_yi * 10  # 亿元
-            info["ten_ps_fair_market_cap_yi"] = round(ten_ps_fair, 2)
-            if nm >= 0.20:  # net margin ≥ 20%
-                info["ten_ps_candidate"] = True
-                info["ten_ps_valuation_verdict"] = "合理/低估"
-                info["ten_ps_valuation_detail"] = "净利率接近25%，适用10PS标尺"
-            else:
-                info["ten_ps_candidate"] = False
-                info["ten_ps_valuation_verdict"] = "不适用"
-                info["ten_ps_valuation_detail"] = "净利率未接近25%，不按10PS标尺"
-
-    info["updated_at"] = "刚刚更新"
+    info.update(valuation)
+    info["dataSource"] = "baostock"
+    info["updatedAt"] = "刚刚"
     return info
+
+
+# ---- Batch collection with persistent sessions ----
+
+class BaostockSessionPool:
+    """Manages multiple baostock sessions for parallel batch collection."""
+
+    def __init__(self, pool_size: int = 3):
+        self.pool_size = pool_size
+        self.sessions: list = []
+        self._lock = threading.Lock()
+
+    def init(self):
+        """Initialize all sessions."""
+        for _ in range(self.pool_size):
+            _bs_lock.acquire()
+            try:
+                bs, lg = _login()
+                self.sessions.append(bs)
+            finally:
+                _bs_lock.release()
+
+    def cleanup(self):
+        """Logout all sessions."""
+        for bs in self.sessions:
+            _bs_lock.acquire()
+            try:
+                _logout(bs, None)
+            finally:
+                _bs_lock.release()
+        self.sessions.clear()
+
+    def get_session(self) -> Optional[object]:
+        """Get a session from pool (thread-safe)."""
+        with self._lock:
+            if self.sessions:
+                return self.sessions.pop(0)
+        return None
+
+    def return_session(self, bs):
+        """Return a session to pool (thread-safe)."""
+        with self._lock:
+            self.sessions.append(bs)
+
+
+# Global session pool for batch operations
+_batch_session_pool: Optional[BaostockSessionPool] = None
+
+
+def init_batch_pool(pool_size: int = 3):
+    """Initialize the global batch session pool."""
+    global _batch_session_pool
+    if _batch_session_pool is None:
+        _batch_session_pool = BaostockSessionPool(pool_size)
+        _batch_session_pool.init()
+
+
+def cleanup_batch_pool():
+    """Cleanup the global batch session pool."""
+    global _batch_session_pool
+    if _batch_session_pool is not None:
+        _batch_session_pool.cleanup()
+        _batch_session_pool = None
+
+
+def _sync_batch_collect_stock(
+    stock_code: str,
+    quarters: int = 16,
+    anti_crawl_delay: tuple = (0.3, 0.8)
+) -> dict:
+    """Collect data for a single stock using pooled session.
+
+    Returns:
+        dict with keys: success, stockCode, stockName, quartersCollected, error
+    """
+    import random
+    import time
+
+    session_pool = _batch_session_pool
+    if session_pool is None:
+        return {"success": False, "error": "Session pool not initialized"}
+
+    bs = session_pool.get_session()
+    if bs is None:
+        return {"success": False, "error": "No available session"}
+
+    try:
+        # Fetch quarterly data with persistent session
+        raw_quarters = _sync_get_quarterly_data(stock_code, quarters, bs_session=bs)
+
+        # Anti-crawl: random delay
+        delay = random.uniform(*anti_crawl_delay)
+        time.sleep(delay)
+
+        if not raw_quarters:
+            return {
+                "success": False,
+                "stockCode": stock_code,
+                "error": "未获取到财务数据"
+            }
+
+        return {
+            "success": True,
+            "stockCode": stock_code,
+            "quartersCollected": len(raw_quarters),
+            "quarters": raw_quarters
+        }
+
+    except Exception as e:
+        logger.error(f"Batch collect failed for {stock_code}: {e}")
+        return {"success": False, "stockCode": stock_code, "error": str(e)}
+
+    finally:
+        session_pool.return_session(bs)
+
+
+def batch_collect_stocks(
+    stock_codes: list[str],
+    quarters: int = 16,
+    pool_size: int = 3,
+    anti_crawl_delay: tuple = (0.3, 0.8)
+) -> list[dict]:
+    """Batch collect data for multiple stocks using thread pool.
+
+    Args:
+        stock_codes: List of stock codes to collect
+        quarters: Number of quarters to fetch
+        pool_size: Number of parallel threads
+        anti_crawl_delay: (min, max) delay in seconds between requests
+
+    Returns:
+        List of result dicts for each stock
+    """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    # Initialize session pool
+    init_batch_pool(pool_size)
+
+    results = []
+    try:
+        with ThreadPoolExecutor(max_workers=pool_size) as executor:
+            future_to_code = {
+                executor.submit(
+                    _sync_batch_collect_stock,
+                    code,
+                    quarters,
+                    anti_crawl_delay
+                ): code
+                for code in stock_codes
+            }
+
+            for future in as_completed(future_to_code):
+                stock_code = future_to_code[future]
+                try:
+                    result = future.result()
+                    results.append(result)
+                except Exception as e:
+                    logger.error(f"Unexpected error for {stock_code}: {e}")
+                    results.append({
+                        "success": False,
+                        "stockCode": stock_code,
+                        "error": str(e)
+                    })
+
+    finally:
+        cleanup_batch_pool()
+
+    return results
+
+
+async def async_batch_collect_stocks(
+    stock_codes: list[str],
+    quarters: int = 16,
+    pool_size: int = 3,
+    anti_crawl_delay: tuple = (0.3, 0.8)
+) -> list[dict]:
+    """Async wrapper for batch collection."""
+    return await asyncio.to_thread(
+        batch_collect_stocks,
+        stock_codes,
+        quarters,
+        pool_size,
+        anti_crawl_delay
+    )
